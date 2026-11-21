@@ -1,4 +1,5 @@
 ﻿mod anim;
+mod audio_player;
 mod awc;
 mod boot;
 mod dat;
@@ -166,7 +167,7 @@ pub fn stop_wav() {
     }
 }
 }
-use plat::{active_window, dock_child_hwnd, find_binkplay, find_hwnd_for_pid, move_window, play_wav_async, stop_wav};
+use plat::{active_window, dock_child_hwnd, find_binkplay, find_hwnd_for_pid, move_window, stop_wav};
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum AppTab {
@@ -472,6 +473,7 @@ struct MediaState {
     loading: bool,
     status: String,
     awc_streams: Vec<(u32, PathBuf)>,
+    awc_seq: u64,
     bink_child_pid: Option<u32>,
     bink_hwnd: Option<isize>,
     bink_clip: Option<PathBuf>,
@@ -648,6 +650,8 @@ struct Rpf9App {
     tex_sel: usize,
     tex_handle: Option<(usize, TextureHandle)>,
     tex_zoom: f32,
+    audio_player: audio_player::AudioPlayerState,
+    audio_awc_seq: u64,
     vehicles_only: bool,
     // cachd ui list so huge scans never re filter or clone evry fram
     view: Vec<usize>,
@@ -771,6 +775,8 @@ impl Rpf9App {
             tex_sel: 0,
             tex_handle: None,
             tex_zoom: 1.0,
+            audio_player: audio_player::AudioPlayerState::default(),
+            audio_awc_seq: 0,
             vehicles_only: false,
             view: Vec::new(),
             view_key: None,
@@ -843,9 +849,13 @@ impl Rpf9App {
         self.tex_handle = None;
         self.tex_zoom = 1.0;
         stop_wav();
+        self.audio_player.stop();
+        self.audio_player.tracks.clear();
+        self.audio_player.active_idx = None;
         self.stop_bink_player();
         let mut m = self.media.lock().unwrap();
         m.awc_streams.clear();
+        m.awc_seq = m.awc_seq.wrapping_add(1);
         m.status.clear();
         m.loading = false;
         m.loaded_mesh = None;
@@ -2776,14 +2786,38 @@ fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
 fn decode_awc_for_player(e: &RpfEntry, media: &Arc<Mutex<MediaState>>) {
     let tmp = std::env::temp_dir().join("rpf9_preview_awc");
     let _ = fs::remove_dir_all(&tmp);
-    let wavs = match read_entry_bytes(e) {
-        Ok(bytes) => awc::decode_awc_bytes_to_wavs(&bytes, &tmp, "stream"),
-        Err(_) => Vec::new(),
-    };
-    let mut m = media.lock().unwrap();
-    m.loading = false;
-    m.status = format!("Decoded {} playable .wav stream(s) natively", wavs.len());
-    m.awc_streams = wavs;
+    match read_entry_bytes(e) {
+        Ok(bytes) => {
+            let res = awc::decode_awc_bytes_to_wavs_detailed(&bytes, &tmp, "stream");
+            let mut m = media.lock().unwrap();
+            m.loading = false;
+            if res.wavs.is_empty() {
+                let mut lines = vec![
+                    format!("Decoded 0 playable .wav stream(s) natively — {}", res.summary),
+                    format!(
+                        "Entry: {} ({} bytes read, comp={}, raw={}, offset=0x{:X}, RPF: {})",
+                        e.name, bytes.len(), e.comp_size, e.raw_size, e.offset, e.rpf_name
+                    ),
+                ];
+                lines.extend(res.details);
+                m.status = lines.join("\n");
+            } else {
+                m.status = format!("Decoded {} playable .wav stream(s) natively", res.wavs.len());
+            }
+            m.awc_streams = res.wavs;
+            m.awc_seq = m.awc_seq.wrapping_add(1);
+        }
+        Err(err) => {
+            let mut m = media.lock().unwrap();
+            m.loading = false;
+            m.status = format!(
+                "Decoded 0 playable .wav stream(s) natively — Read error: {err}\nEntry: {} (comp={}, raw={}, offset=0x{:X}, RPF: {})",
+                e.name, e.comp_size, e.raw_size, e.offset, e.rpf_name
+            );
+            m.awc_streams.clear();
+            m.awc_seq = m.awc_seq.wrapping_add(1);
+        }
+    }
 }
 
 fn setup_style(ctx: &egui::Context) {
@@ -3478,6 +3512,10 @@ impl eframe::App for Rpf9App {
                 self.tex_handle = None;
                 self.tex_zoom = 1.0;
             }
+            if m.awc_seq != self.audio_awc_seq {
+                self.audio_awc_seq = m.awc_seq;
+                self.audio_player.load_streams(&m.awc_streams);
+            }
             (m.loading, m.status.clone(), m.awc_streams.clone())
         };
 
@@ -3767,20 +3805,31 @@ impl eframe::App for Rpf9App {
                     ui.label(RichText::new(&media_status).color(Color32::from_rgb(252, 175, 23)));
                 });
             } else if !awc_streams.is_empty() {
-                ui.label(RichText::new(&media_status).strong().color(Color32::WHITE));
-                ui.add_space(8.0);
-                if ui.button("Stop Audio").clicked() { stop_wav(); }
-                ui.separator();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (idx, wp) in &awc_streams {
-                        ui.horizontal(|ui| {
-                            if ui.button("Play").clicked() { play_wav_async(wp); }
-                            ui.label(format!("Stream #{idx}: {}", wp.file_name().unwrap_or_default().to_string_lossy()));
-                        });
+                audio_player::render_awc_audio_view(ui, ctx, &mut self.audio_player, &media_status);
+            } else if !media_status.is_empty() {
+                let mut lines = media_status.lines();
+                let headline = lines.next().unwrap_or(&media_status);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(headline).strong().color(Color32::from_rgb(255, 140, 120)));
+                    if ui.small_button("Copy").clicked() {
+                        ctx.copy_text(media_status.clone());
                     }
                 });
-            } else if !media_status.is_empty() {
-                ui.label(RichText::new(&media_status).color(Color32::from_rgb(255, 140, 120)));
+                let rest: Vec<&str> = lines.collect();
+                if !rest.is_empty() {
+                    ui.add_space(6.0);
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(30, 18, 44))
+                        .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(110, 58, 78)))
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
+                                for line in rest {
+                                    ui.label(RichText::new(line).monospace().size(11.5).color(Color32::from_rgb(235, 210, 215)));
+                                }
+                            });
+                        });
+                }
             } else if !self.textures.is_empty() {
                 if self.tex_sel >= self.textures.len() {
                     self.tex_sel = 0;
