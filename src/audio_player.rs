@@ -1,63 +1,37 @@
+use crate::awc;
 use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, RichText, Sense, Stroke, Vec2};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 pub struct LoadedWavTrack {
     pub stream_idx: u32,
-    pub path: PathBuf,
     pub name: String,
     pub sample_rate: u32,
     pub channels: u16,
     pub total_frames: usize,
     pub duration_secs: f32,
-    pub samples: Vec<i16>,
+    pub coff: usize,
+    pub csz: usize,
     pub waveform_peaks: Vec<f32>,
     pub waveform_rms: Vec<f32>,
     pub overall_peak: f32,
 }
 
 impl LoadedWavTrack {
-    pub fn from_wav_file(stream_idx: u32, path: &Path) -> Result<Self, String> {
-        let bytes = fs::read(path).map_err(|e| format!("Read error: {e}"))?;
-        if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
-            return Err("Not a valid RIFF/WAVE file".into());
-        }
-        let mut off = 12usize;
-        let mut channels = 1u16;
-        let mut sample_rate = 48_000u32;
-        let mut bits_per_sample = 16u16;
-        let mut data_slice: Option<&[u8]> = None;
-
-        while off + 8 <= bytes.len() {
-            let id = &bytes[off..off + 4];
-            let sz = u32::from_le_bytes([bytes[off + 4], bytes[off + 5], bytes[off + 6], bytes[off + 7]]) as usize;
-            let body_start = off + 8;
-            let body_end = (body_start + sz).min(bytes.len());
-            if id == b"fmt " && body_end - body_start >= 16 {
-                let b = &bytes[body_start..body_end];
-                channels = u16::from_le_bytes([b[2], b[3]]).max(1);
-                sample_rate = u32::from_le_bytes([b[4], b[5], b[6], b[7]]).max(1);
-                bits_per_sample = u16::from_le_bytes([b[14], b[15]]);
-            } else if id == b"data" {
-                data_slice = Some(&bytes[body_start..body_end]);
-                break;
-            }
-            off = body_start + sz + (sz & 1);
-        }
-
-        if bits_per_sample != 16 {
-            return Err(format!("Unsupported WAV bit depth: {bits_per_sample}"));
-        }
-        let raw = data_slice.ok_or_else(|| "Missing WAV data chunk".to_string())?;
-        let mut samples = Vec::with_capacity(raw.len() / 2);
-        for pair in raw.chunks_exact(2) {
-            samples.push(i16::from_le_bytes([pair[0], pair[1]]));
-        }
-
-        let ch = channels as usize;
+    /// Computes waveform & duration from decoded PCM without retaining `samples` in RAM.
+    pub fn from_pcm_summary(
+        stream_idx: u32,
+        name: String,
+        sample_rate: u32,
+        channels: u16,
+        samples: &[i16],
+        coff: usize,
+        csz: usize,
+    ) -> Self {
+        let ch = channels.max(1) as usize;
+        let sr = sample_rate.max(1);
         let total_frames = samples.len() / ch;
-        let duration_secs = total_frames as f32 / sample_rate as f32;
+        let duration_secs = total_frames as f32 / sr as f32;
 
         const BINS: usize = 200;
         let mut waveform_peaks = vec![0.0f32; BINS];
@@ -68,10 +42,12 @@ impl LoadedWavTrack {
             for b in 0..BINS {
                 let f0 = b * total_frames / BINS;
                 let f1 = ((b + 1) * total_frames / BINS).max(f0 + 1).min(total_frames);
+                let stride = ((f1 - f0) / 128).max(1);
                 let mut peak = 0.0f32;
                 let mut sum_sq = 0.0f64;
                 let mut cnt = 0usize;
-                for f in f0..f1 {
+                let mut f = f0;
+                while f < f1 {
                     let base = f * ch;
                     let mut frame_abs = 0.0f32;
                     for c in 0..ch {
@@ -85,6 +61,7 @@ impl LoadedWavTrack {
                     if frame_abs > peak {
                         peak = frame_abs;
                     }
+                    f += stride;
                 }
                 waveform_peaks[b] = peak;
                 waveform_rms[b] = if cnt > 0 { (sum_sq / cnt as f64).sqrt() as f32 } else { 0.0 };
@@ -94,43 +71,37 @@ impl LoadedWavTrack {
             }
         }
 
-        let name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-
-        Ok(Self {
+        Self {
             stream_idx,
-            path: path.to_path_buf(),
             name,
-            sample_rate,
-            channels,
+            sample_rate: sr,
+            channels: channels.max(1),
             total_frames,
             duration_secs,
-            samples,
+            coff,
+            csz,
             waveform_peaks,
             waveform_rms,
             overall_peak,
-        })
+        }
     }
 
-    /// Computes instantaneous peak/RMS loudness around `frame` (within ~40ms window).
-    pub fn loudness_at_frame(&self, frame: usize) -> (f32, f32) {
-        if self.total_frames == 0 {
+    /// Computes instantaneous peak/RMS loudness around `frame` (within ~40ms window) using `active_samples`.
+    pub fn loudness_at_frame(samples: &[i16], channels: u16, sample_rate: u32, total_frames: usize, frame: usize) -> (f32, f32) {
+        if total_frames == 0 || samples.is_empty() {
             return (0.0, 0.0);
         }
-        let ch = self.channels as usize;
-        let win = (self.sample_rate as usize / 25).max(64);
+        let ch = channels.max(1) as usize;
+        let win = (sample_rate as usize / 25).max(64);
         let f0 = frame.saturating_sub(win / 2);
-        let f1 = (frame + win / 2).min(self.total_frames);
+        let f1 = (frame + win / 2).min(samples.len() / ch);
         let mut peak = 0.0f32;
         let mut sum_sq = 0.0f64;
         let mut cnt = 0usize;
         for f in f0..f1 {
             let base = f * ch;
             for c in 0..ch {
-                let s = (self.samples[base + c] as f32 / 32768.0).abs();
+                let s = (samples[base + c] as f32 / 32768.0).abs();
                 if s > peak {
                     peak = s;
                 }
@@ -359,12 +330,17 @@ mod backend {
 
 pub struct AudioPlayerState {
     pub tracks: Vec<LoadedWavTrack>,
+    pub awc_bytes: Option<Arc<Vec<u8>>>,
     pub active_idx: Option<usize>,
+    pub active_samples: Vec<i16>,
     pub playing: bool,
     pub paused: bool,
     pub cursor_frame: usize,
     pub volume: f32,
     pub error: Option<String>,
+    pub decoding_idx: Option<usize>,
+    pending_decode: Arc<Mutex<Option<(usize, Result<Vec<i16>, String>)>>>,
+    decode_gen: u64,
     handle: Option<backend::WaveOutHandle>,
 }
 
@@ -372,39 +348,82 @@ impl Default for AudioPlayerState {
     fn default() -> Self {
         Self {
             tracks: Vec::new(),
+            awc_bytes: None,
             active_idx: None,
+            active_samples: Vec::new(),
             playing: false,
             paused: false,
             cursor_frame: 0,
             volume: 0.85,
             error: None,
+            decoding_idx: None,
+            pending_decode: Arc::new(Mutex::new(None)),
+            decode_gen: 0,
             handle: None,
         }
     }
 }
 
 impl AudioPlayerState {
-    pub fn load_streams(&mut self, streams: &[(u32, PathBuf)]) {
+    pub fn set_tracks(&mut self, tracks: Vec<LoadedWavTrack>, awc_bytes: Arc<Vec<u8>>) {
+        self.stop();
+        self.tracks = tracks;
+        self.awc_bytes = Some(awc_bytes);
+        self.active_idx = None;
+        self.active_samples.clear();
+        self.error = None;
+        self.decoding_idx = None;
+        self.decode_gen = self.decode_gen.wrapping_add(1);
+        *self.pending_decode.lock().unwrap() = None;
+    }
+
+    pub fn clear_all(&mut self) {
         self.stop();
         self.tracks.clear();
+        self.awc_bytes = None;
         self.active_idx = None;
+        self.active_samples.clear();
+        self.active_samples.shrink_to_fit();
         self.error = None;
-        for &(idx, ref p) in streams {
-            if let Ok(t) = LoadedWavTrack::from_wav_file(idx, p) {
-                self.tracks.push(t);
+        self.decoding_idx = None;
+        self.decode_gen = self.decode_gen.wrapping_add(1);
+        *self.pending_decode.lock().unwrap() = None;
+    }
+
+    pub fn poll_decode(&mut self) {
+        let ready = self.pending_decode.lock().unwrap().take();
+        let Some((idx, res)) = ready else { return };
+        if self.decoding_idx != Some(idx) {
+            return;
+        }
+        self.decoding_idx = None;
+        match res {
+            Ok(pcm) => {
+                self.active_samples = pcm;
+                self.active_idx = Some(idx);
+                self.start_playback_at(idx, 0);
+            }
+            Err(e) => {
+                self.error = Some(e);
+                self.playing = false;
+                self.paused = false;
             }
         }
     }
 
-    pub fn play_track(&mut self, idx: usize, start_frame: usize) {
-        let Some(track) = self.tracks.get(idx) else { return };
-        self.handle = None;
-        self.error = None;
-        let clamped = start_frame.min(track.total_frames);
+    fn start_playback_at(&mut self, idx: usize, start_frame: usize) {
+        let Some((sample_rate, channels, total_frames)) = self
+            .tracks
+            .get(idx)
+            .map(|t| (t.sample_rate, t.channels, t.total_frames))
+        else {
+            return;
+        };
+        let clamped = start_frame.min(total_frames);
         match backend::WaveOutHandle::play_from(
-            &track.samples,
-            track.sample_rate,
-            track.channels,
+            &self.active_samples,
+            sample_rate,
+            channels,
             clamped,
             self.volume,
         ) {
@@ -421,6 +440,37 @@ impl AudioPlayerState {
                 self.paused = false;
             }
         }
+    }
+
+    pub fn play_track(&mut self, idx: usize, start_frame: usize) {
+        let Some((coff, csz)) = self.tracks.get(idx).map(|t| (t.coff, t.csz)) else {
+            return;
+        };
+        self.handle = None;
+        self.error = None;
+        self.playing = false;
+        self.paused = false;
+
+        if self.active_idx == Some(idx) && !self.active_samples.is_empty() {
+            self.start_playback_at(idx, start_frame);
+            return;
+        }
+
+        // Decode PCM asynchronously on a worker thread so large streams (e.g. 32 MB / 33 min) never freeze the UI
+        self.active_samples.clear();
+        self.active_idx = Some(idx);
+        self.cursor_frame = 0;
+        let Some(raw) = self.awc_bytes.clone() else {
+            self.error = Some("No AWC buffer loaded".into());
+            return;
+        };
+        self.decoding_idx = Some(idx);
+        let pending = Arc::clone(&self.pending_decode);
+        *pending.lock().unwrap() = None;
+        std::thread::spawn(move || {
+            let res = awc::decode_single_awc_chunk(&raw, coff, csz).map(|(_, pcm)| pcm);
+            *pending.lock().unwrap() = Some((idx, res));
+        });
     }
 
     pub fn toggle_play_pause(&mut self) {
@@ -512,8 +562,9 @@ pub fn render_awc_audio_view(
     player: &mut AudioPlayerState,
     status_headline: &str,
 ) {
+    player.poll_decode();
     let cur_frame = player.current_frame();
-    if player.playing && !player.paused {
+    if (player.playing && !player.paused) || player.decoding_idx.is_some() {
         ctx.request_repaint();
     }
 
@@ -535,15 +586,17 @@ pub fn render_awc_audio_view(
     let player_height = 128.0;
     let list_height = (ui.available_height() - player_height - 8.0).max(80.0);
 
-    // Full-width stream list
+    // Virtualized full-width stream list (renders only visible rows, instant even for 5880+ streams)
     let mut clicked_track: Option<usize> = None;
+    let row_height = 34.0;
     egui::ScrollArea::vertical()
         .id_salt("awc_stream_list")
         .max_height(list_height)
         .auto_shrink([false, false])
-        .show(ui, |ui| {
+        .show_rows(ui, row_height, player.tracks.len(), |ui, row_range| {
             ui.set_min_width(ui.available_width());
-            for (i, t) in player.tracks.iter().enumerate() {
+            for i in row_range {
+                let t = &player.tracks[i];
                 let is_active = player.active_idx == Some(i);
                 let is_playing = is_active && player.playing && !player.paused;
                 let row_bg = if is_active {
@@ -567,7 +620,14 @@ pub fn render_awc_audio_view(
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         ui.horizontal(|ui| {
-                            let btn_label = if is_playing { "Pause" } else { "Play" };
+                            let is_decoding = player.decoding_idx == Some(i);
+                            let btn_label = if is_decoding {
+                                "Loading..."
+                            } else if is_playing {
+                                "Pause"
+                            } else {
+                                "Play"
+                            };
                             let btn = egui::Button::new(
                                 RichText::new(btn_label)
                                     .strong()
@@ -578,7 +638,7 @@ pub fn render_awc_audio_view(
                             } else {
                                 Color32::from_rgb(52, 34, 74)
                             })
-                            .min_size(Vec2::new(48.0, 22.0));
+                            .min_size(Vec2::new(if is_decoding { 72.0 } else { 48.0 }, 22.0));
 
                             if ui.add(btn).clicked() {
                                 clicked_track = Some(i);
@@ -603,7 +663,13 @@ pub fn render_awc_audio_view(
 
                             // Right-aligned metadata + inline peak meter bar
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let (bar_rect, _) = ui.allocate_exact_size(Vec2::new(64.0, 10.0), Sense::hover());
+                                let peak_pct = t.overall_peak.clamp(0.0, 1.0) * 100.0;
+                                let peak_db = if t.overall_peak > 1e-5 { 20.0 * t.overall_peak.log10() } else { -96.0 };
+                                let tip = format!(
+                                    "Max Peak Loudness: {peak_pct:.0}% ({peak_db:.1} dBFS)\nOrange = normal · Pink (>85%) = near clipping"
+                                );
+
+                                let (bar_rect, bar_resp) = ui.allocate_exact_size(Vec2::new(64.0, 10.0), Sense::hover());
                                 let p = ui.painter();
                                 p.rect_filled(bar_rect, CornerRadius::same(2), Color32::from_rgb(40, 26, 58));
                                 let fill_w = (bar_rect.width() * t.overall_peak.clamp(0.0, 1.0)).max(2.0);
@@ -614,8 +680,17 @@ pub fn render_awc_audio_view(
                                     Color32::from_rgb(255, 168, 28)
                                 };
                                 p.rect_filled(fill_rect, CornerRadius::same(2), peak_col);
+                                bar_resp.on_hover_text(&tip);
 
-                                ui.add_space(8.0);
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new(format!("Peak {peak_pct:.0}%"))
+                                        .size(11.0)
+                                        .color(Color32::from_rgb(200, 185, 220)),
+                                )
+                                .on_hover_text(tip);
+
+                                ui.add_space(10.0);
                                 let ch_str = if t.channels == 2 { "Stereo" } else { "Mono" };
                                 ui.label(
                                     RichText::new(format!("{} · {} kHz · {}", fmt_time(t.duration_secs), t.sample_rate / 1000, ch_str))
@@ -675,10 +750,17 @@ pub fn render_awc_audio_view(
                 if ui.add_enabled(active_track.is_some(), egui::Button::new("-5s")).on_hover_text("Seek back 5s").clicked() {
                     player.seek_by_secs(-5.0);
                 }
-                let play_lbl = if player.playing && !player.paused { "Pause" } else { "Play" };
+                let is_decoding_active = player.decoding_idx.is_some();
+                let play_lbl = if is_decoding_active {
+                    "Decoding..."
+                } else if player.playing && !player.paused {
+                    "Pause"
+                } else {
+                    "Play"
+                };
                 let play_btn = egui::Button::new(RichText::new(play_lbl).strong().color(Color32::BLACK))
                     .fill(Color32::from_rgb(255, 168, 28));
-                if ui.add_enabled(!player.tracks.is_empty(), play_btn).clicked() {
+                if ui.add_enabled(!player.tracks.is_empty() && !is_decoding_active, play_btn).clicked() {
                     player.toggle_play_pause();
                 }
                 if ui.add_enabled(player.playing || player.paused, egui::Button::new("Stop")).clicked() {
@@ -807,7 +889,13 @@ pub fn render_awc_audio_view(
                     );
 
                     let (live_peak, live_rms) = if player.playing && !player.paused {
-                        t.loudness_at_frame(cur_frame)
+                        LoadedWavTrack::loudness_at_frame(
+                            &player.active_samples,
+                            t.channels,
+                            t.sample_rate,
+                            t.total_frames,
+                            cur_frame,
+                        )
                     } else {
                         (0.0, 0.0)
                     };

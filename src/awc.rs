@@ -1,12 +1,20 @@
+use crate::audio_player::LoadedWavTrack;
 use rusty_opus::OpusDecoder;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Debug, Clone)]
 pub struct AwcDecodeResult {
     pub wavs: Vec<(u32, PathBuf)>,
+    pub summary: String,
+    pub details: Vec<String>,
+}
+
+pub struct AwcMemoryResult {
+    pub tracks: Vec<LoadedWavTrack>,
     pub summary: String,
     pub details: Vec<String>,
 }
@@ -51,10 +59,20 @@ pub fn decode_awc_bytes_to_wavs(data: &[u8], out_dir: &Path, stem: &str) -> Vec<
     decode_awc_bytes_to_wavs_detailed(data, out_dir, stem).wavs
 }
 
-pub fn decode_awc_bytes_to_wavs_detailed(data: &[u8], out_dir: &Path, stem: &str) -> AwcDecodeResult {
+enum ParsedAdatHeader {
+    Err { summary: String, details: Vec<String> },
+    Ok {
+        flags: u32,
+        sc: usize,
+        raw_hdr_sz: usize,
+        data_chunks: Vec<(usize, usize)>,
+        skipped_chunks: Vec<String>,
+    },
+}
+
+fn parse_adat_header(data: &[u8]) -> ParsedAdatHeader {
     if data.len() < 16 {
-        return AwcDecodeResult {
-            wavs: Vec::new(),
+        return ParsedAdatHeader::Err {
             summary: format!("Payload too small ({} bytes, need >= 16 for ADAT header)", data.len()),
             details: vec![format!("First bytes (hex): {}", fmt_hex(&data[..data.len().min(16)]))],
         };
@@ -75,8 +93,7 @@ pub fn decode_awc_bytes_to_wavs_detailed(data: &[u8], out_dir: &Path, stem: &str
         };
         let mut details = Vec::new();
         push_hex_dump(&mut details, "Payload head", data, 0, 128);
-        return AwcDecodeResult {
-            wavs: Vec::new(),
+        return ParsedAdatHeader::Err {
             summary: format!("Not an ADAT header: got '{}' ({}) in {} bytes{}", ascii4, fmt_hex(&data[..4]), data.len(), hint),
             details,
         };
@@ -86,11 +103,10 @@ pub fn decode_awc_bytes_to_wavs_detailed(data: &[u8], out_dir: &Path, stem: &str
     let sc = ru32(data, 8) as usize;
     let raw_hdr_sz = ru32(data, 12) as usize;
     let hdr_sz = raw_hdr_sz.min(data.len());
-    if sc == 0 || sc > 4096 {
+    if sc == 0 || sc > 65536 || 16 + sc * 4 > data.len() {
         let mut details = Vec::new();
         push_hex_dump(&mut details, "ADAT head", data, 0, 128);
-        return AwcDecodeResult {
-            wavs: Vec::new(),
+        return ParsedAdatHeader::Err {
             summary: format!("Invalid ADAT stream count sc={sc} (flags=0x{flags:08X}, hdr_sz={raw_hdr_sz}, payload={} bytes)", data.len()),
             details,
         };
@@ -101,8 +117,7 @@ pub fn decode_awc_bytes_to_wavs_detailed(data: &[u8], out_dir: &Path, stem: &str
     if off + 8 > hdr_sz {
         let mut details = vec![format!("flags=0x{flags:08X}, payload={} bytes", data.len())];
         push_hex_dump(&mut details, "ADAT header", data, 0, hdr_sz.max(64).min(512));
-        return AwcDecodeResult {
-            wavs: Vec::new(),
+        return ParsedAdatHeader::Err {
             summary: format!("ADAT header too small for chunk table (table_off=0x{off:X}, hdr_sz=0x{hdr_sz:X}, raw_hdr_sz=0x{raw_hdr_sz:X}, sc={sc})"),
             details,
         };
@@ -132,8 +147,12 @@ pub fn decode_awc_bytes_to_wavs_detailed(data: &[u8], out_dir: &Path, stem: &str
                 skipped_chunks.push(format!("0x55 chunk at off=0x{coff:X} has sz=0"));
             } else if coff < 0x20 {
                 skipped_chunks.push(format!("0x55 chunk has invalid off=0x{coff:X} (< 0x20), sz={sz}"));
+            } else if coff >= data.len() {
+                skipped_chunks.push(format!("0x55 chunk out of bounds: off=0x{coff:X} >= len={}", data.len()));
             } else if coff + sz > data.len() {
-                skipped_chunks.push(format!("0x55 chunk out of bounds: off=0x{coff:X} + sz={sz} > len={}", data.len()));
+                let avail = data.len() - coff;
+                skipped_chunks.push(format!("0x55 chunk truncated in RPF (off=0x{coff:X}, header_sz={sz}, clamped to {avail} bytes)"));
+                data_chunks.push((coff, avail));
             } else {
                 data_chunks.push((coff, sz));
             }
@@ -151,8 +170,8 @@ pub fn decode_awc_bytes_to_wavs_detailed(data: &[u8], out_dir: &Path, stem: &str
             let tag = (val >> 56) as u8;
             let sz = ((val >> 28) & 0x0FFF_FFFF) as usize;
             let coff = (val & 0x0FFF_FFFF) as usize;
-            if tag == 0x55 && sz > 0 && coff >= hdr_sz && coff + sz <= data.len() {
-                data_chunks.push((coff, sz));
+            if tag == 0x55 && sz > 0 && coff >= hdr_sz && coff < data.len() {
+                data_chunks.push((coff, sz.min(data.len() - coff)));
             } else if !matches!(tag, 0x48 | 0x55 | 0x76 | 0xA3 | 0xBD | 0xFA | 0xFF) && coff > data.len() {
                 break;
             }
@@ -186,7 +205,6 @@ pub fn decode_awc_bytes_to_wavs_detailed(data: &[u8], out_dir: &Path, stem: &str
         }
         details.extend(skipped_chunks);
 
-        // Scan 0x10..hdr_sz at every byte offset for valid 0x55 u64 chunk descriptors
         let mut alt_0x55 = Vec::new();
         for probe in 0x10..hdr_sz.saturating_sub(7) {
             let val = ru64(data, probe);
@@ -209,12 +227,208 @@ pub fn decode_awc_bytes_to_wavs_detailed(data: &[u8], out_dir: &Path, stem: &str
             push_hex_dump(&mut details, "Post-header bytes @ hdr_sz", &data[hdr_sz..], hdr_sz, 96);
         }
 
-        return AwcDecodeResult {
-            wavs: Vec::new(),
+        return ParsedAdatHeader::Err {
             summary: format!("No valid 0x55 Opus data chunks found (seen tags: [{tags_str}])"),
             details,
         };
     }
+
+    ParsedAdatHeader::Ok {
+        flags,
+        sc,
+        raw_hdr_sz,
+        data_chunks,
+        skipped_chunks,
+    }
+}
+
+pub fn decode_single_awc_chunk(data: &[u8], coff: usize, csz: usize) -> Result<(u16, Vec<i16>), String> {
+    if coff >= data.len() || coff.saturating_add(csz) > data.len() {
+        return Err(format!("Chunk out of bounds (off=0x{coff:X}, sz={csz}, len={})", data.len()));
+    }
+    let mut pcm_f32 = vec![0.0f32; 5760 * 2];
+    let mut samples_i16 = Vec::new();
+    let ch = decode_opus_chunk_into(0, data, coff, csz, &mut pcm_f32, &mut samples_i16)
+        .map_err(|notes| notes.join("\n"))?;
+    Ok((ch, samples_i16))
+}
+
+fn decode_opus_chunk_into(
+    idx: usize,
+    data: &[u8],
+    coff: usize,
+    csz: usize,
+    pcm_f32: &mut Vec<f32>,
+    samples_i16: &mut Vec<i16>,
+) -> Result<u16, Vec<String>> {
+    samples_i16.clear();
+    let blob = &data[coff..coff + csz];
+    let mut packets: Vec<&[u8]> = Vec::new();
+    for blk in blob.chunks(2048) {
+        let mut p = 0usize;
+        while p + 2 <= blk.len() {
+            let plen = ru16(blk, p) as usize;
+            if plen == 0 || p + 2 + plen > blk.len() {
+                break;
+            }
+            packets.push(&blk[p + 2..p + 2 + plen]);
+            p += 2 + plen;
+        }
+    }
+    if packets.is_empty() {
+        let first_u16 = if blob.len() >= 2 { format!("0x{:04X} ({})", ru16(blob, 0), ru16(blob, 0)) } else { "n/a".into() };
+        let mut notes = vec![format!("Chunk #{idx} (off=0x{coff:X}, sz={csz}): 0 Opus packets found in 2KB blocks (first_u16={first_u16})")];
+        push_hex_dump(&mut notes, &format!("Chunk #{idx} head"), blob, coff, 64);
+        return Err(notes);
+    }
+
+    let ch: usize = if (packets[0][0] & 0x04) != 0 { 2 } else { 1 };
+    let mut dec = OpusDecoder::new(48_000, ch)
+        .map_err(|err| vec![format!("Chunk #{idx} (ch={ch}): OpusDecoder::new(48000, {ch}) failed: {err:?}")])?;
+    if pcm_f32.len() < 5760 * ch {
+        pcm_f32.resize(5760 * ch, 0.0);
+    }
+    let need = packets.len() * 960 * ch;
+    if samples_i16.capacity() < need {
+        samples_i16.reserve(need - samples_i16.capacity());
+    }
+    let mut ok_pkts = 0usize;
+    let mut err_pkts = 0usize;
+    let mut first_err: Option<String> = None;
+
+    for pkt in &packets {
+        match dec.decode(pkt, 5760, &mut pcm_f32[..5760 * ch]) {
+            Ok(n_per_ch) => {
+                ok_pkts += 1;
+                for &s in &pcm_f32[..n_per_ch * ch] {
+                    samples_i16.push((s.clamp(-1.0, 1.0) * 32767.0) as i16);
+                }
+            }
+            Err(err) => {
+                err_pkts += 1;
+                if first_err.is_none() {
+                    first_err = Some(format!("{err:?}"));
+                }
+            }
+        }
+    }
+    if samples_i16.is_empty() {
+        let mut notes = vec![format!(
+            "Chunk #{idx} (off=0x{coff:X}, sz={csz}, ch={ch}, pkts={}): 0 PCM samples ({ok_pkts} ok, {err_pkts} err, toc=0x{:02X}, err={})",
+            packets.len(),
+            packets[0][0],
+            first_err.as_deref().unwrap_or("none")
+        )];
+        push_hex_dump(&mut notes, &format!("Chunk #{idx} head"), blob, coff, 64);
+        return Err(notes);
+    }
+    Ok(ch as u16)
+}
+
+fn decode_opus_chunk(idx: usize, data: &[u8], coff: usize, csz: usize, pcm_f32: &mut Vec<f32>) -> Result<(u16, Vec<i16>), Vec<String>> {
+    let mut samples_i16 = Vec::new();
+    let ch = decode_opus_chunk_into(idx, data, coff, csz, pcm_f32, &mut samples_i16)?;
+    Ok((ch, samples_i16))
+}
+
+pub fn decode_awc_bytes_in_memory<F>(data: &[u8], stem: &str, on_progress: F) -> AwcMemoryResult
+where
+    F: Fn(usize, usize) + Sync,
+{
+    let (flags, sc, raw_hdr_sz, data_chunks, skipped_chunks) = match parse_adat_header(data) {
+        ParsedAdatHeader::Err { summary, details } => {
+            return AwcMemoryResult { tracks: Vec::new(), summary, details };
+        }
+        ParsedAdatHeader::Ok { flags, sc, raw_hdr_sz, data_chunks, skipped_chunks } => {
+            (flags, sc, raw_hdr_sz, data_chunks, skipped_chunks)
+        }
+    };
+
+    let total = data_chunks.len();
+    let next_idx = AtomicUsize::new(0);
+    let done_cnt = AtomicUsize::new(0);
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(total)
+        .max(1);
+
+    let results: Vec<(Vec<LoadedWavTrack>, Vec<String>)> = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(n_threads);
+        for _ in 0..n_threads {
+            handles.push(s.spawn(|| {
+                let mut local_tracks = Vec::new();
+                let mut local_notes = Vec::new();
+                let mut pcm_f32 = vec![0.0f32; 5760 * 2];
+                let mut samples_i16 = Vec::new();
+                loop {
+                    let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                    if idx >= total {
+                        break;
+                    }
+                    let (coff, csz) = data_chunks[idx];
+                    match decode_opus_chunk_into(idx, data, coff, csz, &mut pcm_f32, &mut samples_i16) {
+                        Ok(ch) => {
+                            let name = format!("{stem}_s{idx:02}.wav");
+                            local_tracks.push(LoadedWavTrack::from_pcm_summary(
+                                idx as u32 + 1,
+                                name,
+                                48_000,
+                                ch,
+                                &samples_i16,
+                                coff,
+                                csz,
+                            ));
+                        }
+                        Err(notes) => {
+                            if local_notes.len() < 20 {
+                                local_notes.extend(notes);
+                            }
+                        }
+                    }
+                    let d = done_cnt.fetch_add(1, Ordering::Relaxed) + 1;
+                    if d == total || d % 8 == 0 {
+                        on_progress(d, total);
+                    }
+                }
+                (local_tracks, local_notes)
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut tracks = Vec::new();
+    let mut chunk_notes = Vec::new();
+    for (lt, ln) in results {
+        tracks.extend(lt);
+        chunk_notes.extend(ln);
+    }
+    tracks.sort_by_key(|t| t.stream_idx);
+
+    let summary = if tracks.is_empty() {
+        format!("Found {} 0x55 chunk(s) (sc={sc}, flags=0x{flags:08X}), but 0 decoded to playable WAV", total)
+    } else {
+        format!("Decoded {} playable .wav stream(s) natively", tracks.len())
+    };
+    let mut details = Vec::new();
+    if tracks.is_empty() {
+        details.push(format!("ADAT header: flags=0x{flags:08X}, streams(sc)={sc}, hdr_sz=0x{raw_hdr_sz:X}, 0x55_chunks={total}"));
+    }
+    details.extend(skipped_chunks);
+    details.extend(chunk_notes);
+
+    AwcMemoryResult { tracks, summary, details }
+}
+
+pub fn decode_awc_bytes_to_wavs_detailed(data: &[u8], out_dir: &Path, stem: &str) -> AwcDecodeResult {
+    let (flags, sc, raw_hdr_sz, data_chunks, skipped_chunks) = match parse_adat_header(data) {
+        ParsedAdatHeader::Err { summary, details } => {
+            return AwcDecodeResult { wavs: Vec::new(), summary, details };
+        }
+        ParsedAdatHeader::Ok { flags, sc, raw_hdr_sz, data_chunks, skipped_chunks } => {
+            (flags, sc, raw_hdr_sz, data_chunks, skipped_chunks)
+        }
+    };
 
     let _ = fs::create_dir_all(out_dir);
     let mut wavs = Vec::new();
@@ -222,73 +436,15 @@ pub fn decode_awc_bytes_to_wavs_detailed(data: &[u8], out_dir: &Path, stem: &str
     let mut chunk_notes: Vec<String> = Vec::new();
 
     for (idx, &(coff, csz)) in data_chunks.iter().enumerate() {
-        let blob = &data[coff..coff + csz];
-        let mut packets: Vec<&[u8]> = Vec::new();
-        // rage opus splits payloads into 2kb blocks of u16 prefixed frams
-        for blk in blob.chunks(2048) {
-            let mut p = 0usize;
-            while p + 2 <= blk.len() {
-                let plen = ru16(blk, p) as usize;
-                if plen == 0 || p + 2 + plen > blk.len() {
-                    break;
-                }
-                packets.push(&blk[p + 2..p + 2 + plen]);
-                p += 2 + plen;
-            }
-        }
-        if packets.is_empty() {
-            let first_u16 = if blob.len() >= 2 { format!("0x{:04X} ({})", ru16(blob, 0), ru16(blob, 0)) } else { "n/a".into() };
-            chunk_notes.push(format!(
-                "Chunk #{idx} (off=0x{coff:X}, sz={csz}): 0 Opus packets found in 2KB blocks (first_u16={first_u16})"
-            ));
-            push_hex_dump(&mut chunk_notes, &format!("Chunk #{idx} head"), blob, coff, 64);
-            continue;
-        }
-
-        let ch: usize = if (packets[0][0] & 0x04) != 0 { 2 } else { 1 };
-        let mut dec = match OpusDecoder::new(48_000, ch) {
-            Ok(d) => d,
-            Err(err) => {
-                chunk_notes.push(format!("Chunk #{idx} (ch={ch}): OpusDecoder::new(48000, {ch}) failed: {err:?}"));
-                continue;
-            }
-        };
-        let mut samples_i16: Vec<i16> = Vec::with_capacity(packets.len() * 960 * ch);
-        let mut ok_pkts = 0usize;
-        let mut err_pkts = 0usize;
-        let mut first_err: Option<String> = None;
-
-        for pkt in &packets {
-            match dec.decode(pkt, 5760, &mut pcm_f32[..5760 * ch]) {
-                Ok(n_per_ch) => {
-                    ok_pkts += 1;
-                    for &s in &pcm_f32[..n_per_ch * ch] {
-                        samples_i16.push((s.clamp(-1.0, 1.0) * 32767.0) as i16);
-                    }
-                }
-                Err(err) => {
-                    err_pkts += 1;
-                    if first_err.is_none() {
-                        first_err = Some(format!("{err:?}"));
-                    }
+        match decode_opus_chunk(idx, data, coff, csz, &mut pcm_f32) {
+            Ok((ch, samples_i16)) => {
+                let wav_p = out_dir.join(format!("{stem}_s{idx:02}.wav"));
+                match write_pcm_wav(&wav_p, 48_000, ch, &samples_i16) {
+                    Ok(()) => wavs.push((idx as u32 + 1, wav_p)),
+                    Err(err) => chunk_notes.push(format!("Chunk #{idx}: WAV write error ({}): {err}", wav_p.display())),
                 }
             }
-        }
-        if samples_i16.is_empty() {
-            chunk_notes.push(format!(
-                "Chunk #{idx} (off=0x{coff:X}, sz={csz}, ch={ch}, pkts={}): 0 PCM samples ({ok_pkts} ok, {err_pkts} err, toc=0x{:02X}, err={})",
-                packets.len(),
-                packets[0][0],
-                first_err.as_deref().unwrap_or("none")
-            ));
-            push_hex_dump(&mut chunk_notes, &format!("Chunk #{idx} head"), blob, coff, 64);
-            continue;
-        }
-
-        let wav_p = out_dir.join(format!("{stem}_s{idx:02}.wav"));
-        match write_pcm_wav(&wav_p, 48_000, ch as u16, &samples_i16) {
-            Ok(()) => wavs.push((idx as u32 + 1, wav_p)),
-            Err(err) => chunk_notes.push(format!("Chunk #{idx}: WAV write error ({}): {err}", wav_p.display())),
+            Err(notes) => chunk_notes.extend(notes),
         }
     }
 

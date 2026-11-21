@@ -473,8 +473,7 @@ struct ScanState {
 struct MediaState {
     loading: bool,
     status: String,
-    awc_streams: Vec<(u32, PathBuf)>,
-    awc_seq: u64,
+    loaded_tracks: Option<(Vec<audio_player::LoadedWavTrack>, Arc<Vec<u8>>)>,
     bink_child_pid: Option<u32>,
     bink_hwnd: Option<isize>,
     bink_clip: Option<PathBuf>,
@@ -652,7 +651,6 @@ struct Rpf9App {
     tex_handle: Option<(usize, TextureHandle)>,
     tex_zoom: f32,
     audio_player: audio_player::AudioPlayerState,
-    audio_awc_seq: u64,
     vehicles_only: bool,
     // cachd ui list so huge scans never re filter or clone evry fram
     view: Vec<usize>,
@@ -777,7 +775,6 @@ impl Rpf9App {
             tex_handle: None,
             tex_zoom: 1.0,
             audio_player: audio_player::AudioPlayerState::default(),
-            audio_awc_seq: 0,
             vehicles_only: false,
             view: Vec::new(),
             view_key: None,
@@ -850,13 +847,10 @@ impl Rpf9App {
         self.tex_handle = None;
         self.tex_zoom = 1.0;
         stop_wav();
-        self.audio_player.stop();
-        self.audio_player.tracks.clear();
-        self.audio_player.active_idx = None;
+        self.audio_player.clear_all();
         self.stop_bink_player();
         let mut m = self.media.lock().unwrap();
-        m.awc_streams.clear();
-        m.awc_seq = m.awc_seq.wrapping_add(1);
+        m.loaded_tracks = None;
         m.status.clear();
         m.loading = false;
         m.loaded_mesh = None;
@@ -2794,14 +2788,16 @@ fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn decode_awc_for_player(e: &RpfEntry, media: &Arc<Mutex<MediaState>>) {
-    let tmp = std::env::temp_dir().join("rpf9_preview_awc");
-    let _ = fs::remove_dir_all(&tmp);
     match read_entry_bytes(e) {
         Ok(bytes) => {
-            let res = awc::decode_awc_bytes_to_wavs_detailed(&bytes, &tmp, "stream");
+            let res = awc::decode_awc_bytes_in_memory(&bytes, "stream", |done, total| {
+                if let Ok(mut m) = media.lock() {
+                    m.status = format!("Decoding {} ({done}/{total} streams)...", e.name);
+                }
+            });
             let mut m = media.lock().unwrap();
             m.loading = false;
-            if res.wavs.is_empty() {
+            if res.tracks.is_empty() {
                 let mut lines = vec![
                     format!("Decoded 0 playable .wav stream(s) natively — {}", res.summary),
                     format!(
@@ -2811,11 +2807,11 @@ fn decode_awc_for_player(e: &RpfEntry, media: &Arc<Mutex<MediaState>>) {
                 ];
                 lines.extend(res.details);
                 m.status = lines.join("\n");
+                m.loaded_tracks = None;
             } else {
-                m.status = format!("Decoded {} playable .wav stream(s) natively", res.wavs.len());
+                m.status = format!("Decoded {} playable .wav stream(s) natively", res.tracks.len());
+                m.loaded_tracks = Some((res.tracks, Arc::new(bytes)));
             }
-            m.awc_streams = res.wavs;
-            m.awc_seq = m.awc_seq.wrapping_add(1);
         }
         Err(err) => {
             let mut m = media.lock().unwrap();
@@ -2824,8 +2820,7 @@ fn decode_awc_for_player(e: &RpfEntry, media: &Arc<Mutex<MediaState>>) {
                 "Decoded 0 playable .wav stream(s) natively — Read error: {err}\nEntry: {} (comp={}, raw={}, offset=0x{:X}, RPF: {})",
                 e.name, e.comp_size, e.raw_size, e.offset, e.rpf_name
             );
-            m.awc_streams.clear();
-            m.awc_seq = m.awc_seq.wrapping_add(1);
+            m.loaded_tracks = None;
         }
     }
 }
@@ -3509,7 +3504,7 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
 impl eframe::App for Rpf9App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_sgd5_cache();
-        let (media_loading, media_status, awc_streams) = {
+        let (media_loading, media_status) = {
             let mut m = self.media.lock().unwrap();
             if let Some(mesh) = m.loaded_mesh.take() {
                 self.textures.clear();
@@ -3525,11 +3520,10 @@ impl eframe::App for Rpf9App {
                 self.tex_handle = None;
                 self.tex_zoom = 1.0;
             }
-            if m.awc_seq != self.audio_awc_seq {
-                self.audio_awc_seq = m.awc_seq;
-                self.audio_player.load_streams(&m.awc_streams);
+            if let Some((tracks, awc_bytes)) = m.loaded_tracks.take() {
+                self.audio_player.set_tracks(tracks, awc_bytes);
             }
-            (m.loading, m.status.clone(), m.awc_streams.clone())
+            (m.loading, m.status.clone())
         };
 
         egui::TopBottomPanel::top("top").frame(egui::Frame::new().fill(Color32::from_rgb(24, 14, 36)).inner_margin(10.0)).show(ctx, |ui| {
@@ -3817,7 +3811,7 @@ impl eframe::App for Rpf9App {
                     draw_percystar_spinner(ui, 24.0);
                     ui.label(RichText::new(&media_status).color(Color32::from_rgb(252, 175, 23)));
                 });
-            } else if !awc_streams.is_empty() {
+            } else if !self.audio_player.tracks.is_empty() {
                 audio_player::render_awc_audio_view(ui, ctx, &mut self.audio_player, &media_status);
             } else if !media_status.is_empty() {
                 let mut lines = media_status.lines();
