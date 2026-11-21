@@ -242,13 +242,43 @@ fn parse_adat_header(data: &[u8]) -> ParsedAdatHeader {
     }
 }
 
-pub fn decode_single_awc_chunk(data: &[u8], coff: usize, csz: usize) -> Result<(u16, Vec<i16>), String> {
+/// Checks if a 0x55 data chunk starts with a 512 KB superblock directory (`0xFFFFFFFF` + `u32` block count per stream, 24 bytes each).
+fn probe_superblock_streams(blob: &[u8]) -> Option<usize> {
+    if blob.len() < 4096 {
+        return None;
+    }
+    let mut n = 0usize;
+    let mut total_blks = 0usize;
+    while (n + 1) * 24 <= blob.len().min(2048) {
+        if ru32(blob, n * 24) != 0xFFFF_FFFF {
+            break;
+        }
+        let cnt = ru32(blob, n * 24 + 4) as usize;
+        if cnt == 0 || cnt > 255 {
+            break;
+        }
+        total_blks += cnt;
+        n += 1;
+    }
+    if n >= 1 && total_blks <= 255 {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+pub fn decode_single_awc_chunk(
+    data: &[u8],
+    coff: usize,
+    csz: usize,
+    sub_stream: Option<(usize, usize)>,
+) -> Result<(u16, Vec<i16>), String> {
     if coff >= data.len() || coff.saturating_add(csz) > data.len() {
         return Err(format!("Chunk out of bounds (off=0x{coff:X}, sz={csz}, len={})", data.len()));
     }
     let mut pcm_f32 = vec![0.0f32; 5760 * 2];
     let mut samples_i16 = Vec::new();
-    let ch = decode_opus_chunk_into(0, data, coff, csz, &mut pcm_f32, &mut samples_i16)
+    let ch = decode_opus_chunk_into(0, data, coff, csz, sub_stream, &mut pcm_f32, &mut samples_i16)
         .map_err(|notes| notes.join("\n"))?;
     Ok((ch, samples_i16))
 }
@@ -258,21 +288,68 @@ fn decode_opus_chunk_into(
     data: &[u8],
     coff: usize,
     csz: usize,
+    sub_stream: Option<(usize, usize)>,
     pcm_f32: &mut Vec<f32>,
     samples_i16: &mut Vec<i16>,
 ) -> Result<u16, Vec<String>> {
     samples_i16.clear();
     let blob = &data[coff..coff + csz];
     let mut packets: Vec<&[u8]> = Vec::new();
-    for blk in blob.chunks(2048) {
-        let mut p = 0usize;
-        while p + 2 <= blk.len() {
-            let plen = ru16(blk, p) as usize;
-            if plen == 0 || p + 2 + plen > blk.len() {
+
+    if let Some((sub_idx, n_sub)) = sub_stream {
+        // 512 KB (0x80000) superblock-interleaved container: each 512 KB superblock starts with `n_sub` 24-byte descriptors
+        // followed by `total_blks * 4` sample-offset table bytes (padded to 2048-byte blocks), then each stream's 2KB blocks sequentially.
+        for sb in blob.chunks(0x80000) {
+            if sb.len() < n_sub * 24 {
                 break;
             }
-            packets.push(&blk[p + 2..p + 2 + plen]);
-            p += 2 + plen;
+            let mut counts = Vec::with_capacity(n_sub);
+            let mut valid_dir = true;
+            let mut total_blks = 0usize;
+            for s in 0..n_sub {
+                if ru32(sb, s * 24) != 0xFFFF_FFFF {
+                    valid_dir = false;
+                    break;
+                }
+                let c = ru32(sb, s * 24 + 4) as usize;
+                total_blks += c;
+                counts.push(c);
+            }
+            if !valid_dir || total_blks == 0 || total_blks > 256 {
+                continue;
+            }
+            let dir_bytes = n_sub * 24 + total_blks * 4;
+            let dir_blks = ((dir_bytes + 2047) / 2048).max(1);
+            let start_blk: usize = dir_blks + counts[..sub_idx].iter().sum::<usize>();
+            let my_blks = counts[sub_idx];
+            for b in start_blk..start_blk + my_blks {
+                let boff = b * 2048;
+                if boff >= sb.len() {
+                    break;
+                }
+                let blk = &sb[boff..(boff + 2048).min(sb.len())];
+                let mut p = 0usize;
+                while p + 2 <= blk.len() {
+                    let plen = ru16(blk, p) as usize;
+                    if plen == 0 || p + 2 + plen > blk.len() {
+                        break;
+                    }
+                    packets.push(&blk[p + 2..p + 2 + plen]);
+                    p += 2 + plen;
+                }
+            }
+        }
+    } else {
+        for blk in blob.chunks(2048) {
+            let mut p = 0usize;
+            while p + 2 <= blk.len() {
+                let plen = ru16(blk, p) as usize;
+                if plen == 0 || p + 2 + plen > blk.len() {
+                    break;
+                }
+                packets.push(&blk[p + 2..p + 2 + plen]);
+                p += 2 + plen;
+            }
         }
     }
     if packets.is_empty() {
@@ -327,7 +404,7 @@ fn decode_opus_chunk_into(
 
 fn decode_opus_chunk(idx: usize, data: &[u8], coff: usize, csz: usize, pcm_f32: &mut Vec<f32>) -> Result<(u16, Vec<i16>), Vec<String>> {
     let mut samples_i16 = Vec::new();
-    let ch = decode_opus_chunk_into(idx, data, coff, csz, pcm_f32, &mut samples_i16)?;
+    let ch = decode_opus_chunk_into(idx, data, coff, csz, None, pcm_f32, &mut samples_i16)?;
     Ok((ch, samples_i16))
 }
 
@@ -344,7 +421,19 @@ where
         }
     };
 
-    let total = data_chunks.len();
+    // Expand any 512 KB superblock-interleaved 0x55 chunk into its individual sub-streams
+    let mut jobs: Vec<(usize, usize, Option<(usize, usize)>)> = Vec::new();
+    for &(coff, csz) in &data_chunks {
+        if let Some(n_sub) = probe_superblock_streams(&data[coff..coff + csz]) {
+            for sub_idx in 0..n_sub {
+                jobs.push((coff, csz, Some((sub_idx, n_sub))));
+            }
+        } else {
+            jobs.push((coff, csz, None));
+        }
+    }
+
+    let total = jobs.len();
     let next_idx = AtomicUsize::new(0);
     let done_cnt = AtomicUsize::new(0);
     let n_threads = std::thread::available_parallelism()
@@ -366,8 +455,8 @@ where
                     if idx >= total {
                         break;
                     }
-                    let (coff, csz) = data_chunks[idx];
-                    match decode_opus_chunk_into(idx, data, coff, csz, &mut pcm_f32, &mut samples_i16) {
+                    let (coff, csz, sub_stream) = jobs[idx];
+                    match decode_opus_chunk_into(idx, data, coff, csz, sub_stream, &mut pcm_f32, &mut samples_i16) {
                         Ok(ch) => {
                             let name = format!("{stem}_s{idx:02}.wav");
                             local_tracks.push(LoadedWavTrack::from_pcm_summary(
@@ -378,6 +467,7 @@ where
                                 &samples_i16,
                                 coff,
                                 csz,
+                                sub_stream,
                             ));
                         }
                         Err(notes) => {

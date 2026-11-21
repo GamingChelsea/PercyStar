@@ -12,6 +12,7 @@ pub struct LoadedWavTrack {
     pub duration_secs: f32,
     pub coff: usize,
     pub csz: usize,
+    pub sub_stream: Option<(usize, usize)>,
     pub waveform_peaks: Vec<f32>,
     pub waveform_rms: Vec<f32>,
     pub overall_peak: f32,
@@ -27,6 +28,7 @@ impl LoadedWavTrack {
         samples: &[i16],
         coff: usize,
         csz: usize,
+        sub_stream: Option<(usize, usize)>,
     ) -> Self {
         let ch = channels.max(1) as usize;
         let sr = sample_rate.max(1);
@@ -80,6 +82,7 @@ impl LoadedWavTrack {
             duration_secs,
             coff,
             csz,
+            sub_stream,
             waveform_peaks,
             waveform_rms,
             overall_peak,
@@ -117,10 +120,15 @@ impl LoadedWavTrack {
 #[cfg(windows)]
 mod backend {
     use std::mem::size_of;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
 
     const WAVE_MAPPER: u32 = 0xFFFF_FFFF;
     const TIME_BYTES: u32 = 0x0004;
     const WHDR_DONE: u32 = 0x0000_0001;
+    const NUM_BUFS: usize = 4;
 
     #[repr(C)]
     struct WAVEFORMATEX {
@@ -165,32 +173,52 @@ mod backend {
         fn waveOutSetVolume(hwo: isize, dw_volume: u32) -> u32;
     }
 
+    struct RingSlot {
+        hdr: Box<WAVEHDR>,
+        buf: Vec<u8>,
+        prepared: bool,
+    }
+
+    // Safety: RingSlot owns its heap WAVEHDR and byte buffer; accessed only by feeder thread until joined in Drop.
+    unsafe impl Send for RingSlot {}
+
     pub struct WaveOutHandle {
         hwo: isize,
-        hdr: Box<WAVEHDR>,
-        _pcm_buf: Vec<u8>,
         block_align: usize,
         pub start_frame: usize,
         pub total_frames: usize,
+        stop_flag: Arc<AtomicBool>,
+        finished: Arc<AtomicBool>,
+        feeder: Option<JoinHandle<()>>,
+        slots: Arc<std::sync::Mutex<Vec<RingSlot>>>,
     }
 
-    // Safety: WaveOutHandle owns its pinned heap WAVEHDR and PCM Vec<u8> and is only accessed via &mut on the UI thread or Drop.
     unsafe impl Send for WaveOutHandle {}
 
+    fn fill_slot(slot: &mut RingSlot, samples: &[i16], ch: usize, cursor: &mut usize, total_frames: usize, chunk_frames: usize) -> bool {
+        if *cursor >= total_frames {
+            return false;
+        }
+        let end = (*cursor + chunk_frames).min(total_frames);
+        let slice = &samples[*cursor * ch..end * ch];
+        slot.buf.clear();
+        slot.buf.reserve(slice.len() * 2);
+        for &s in slice {
+            slot.buf.extend_from_slice(&s.to_le_bytes());
+        }
+        slot.hdr.lp_data = slot.buf.as_mut_ptr();
+        slot.hdr.dw_buffer_length = slot.buf.len() as u32;
+        *cursor = end;
+        true
+    }
+
     impl WaveOutHandle {
-        pub fn play_from(samples: &[i16], sample_rate: u32, channels: u16, start_frame: usize, volume: f32) -> Result<Self, String> {
+        pub fn play_from(samples: Arc<Vec<i16>>, sample_rate: u32, channels: u16, start_frame: usize, volume: f32) -> Result<Self, String> {
             let ch = channels.max(1) as usize;
             let block_align = ch * 2;
             let total_frames = samples.len() / ch;
             let start = start_frame.min(total_frames);
-            let slice = &samples[start * ch..];
-            let mut pcm_buf = Vec::with_capacity(slice.len() * 2);
-            for &s in slice {
-                pcm_buf.extend_from_slice(&s.to_le_bytes());
-            }
-            if pcm_buf.is_empty() {
-                pcm_buf.extend_from_slice(&[0u8; 4]);
-            }
+            let chunk_frames = (sample_rate as usize / 5).max(1024); // ~200ms per ring buffer
 
             let wfx = WAVEFORMATEX {
                 w_format_tag: 1,
@@ -208,38 +236,87 @@ mod backend {
                 return Err(format!("waveOutOpen failed (code {rc})"));
             }
 
-            let mut hdr = Box::new(WAVEHDR {
-                lp_data: pcm_buf.as_mut_ptr(),
-                dw_buffer_length: pcm_buf.len() as u32,
-                dw_bytes_recorded: 0,
-                dw_user: 0,
-                dw_flags: 0,
-                dw_loops: 0,
-                lp_next: 0,
-                reserved: 0,
-            });
-
-            let rc_prep = unsafe { waveOutPrepareHeader(hwo, &mut *hdr, size_of::<WAVEHDR>() as u32) };
-            if rc_prep != 0 {
-                unsafe { waveOutClose(hwo); }
-                return Err(format!("waveOutPrepareHeader failed (code {rc_prep})"));
+            let mut slots = Vec::with_capacity(NUM_BUFS);
+            let mut cursor = start;
+            for _ in 0..NUM_BUFS {
+                let mut buf = Vec::with_capacity(chunk_frames * block_align);
+                let mut slot = RingSlot {
+                    hdr: Box::new(WAVEHDR {
+                        lp_data: buf.as_mut_ptr(),
+                        dw_buffer_length: 0,
+                        dw_bytes_recorded: 0,
+                        dw_user: 0,
+                        dw_flags: WHDR_DONE,
+                        dw_loops: 0,
+                        lp_next: 0,
+                        reserved: 0,
+                    }),
+                    buf,
+                    prepared: false,
+                };
+                if fill_slot(&mut slot, &samples, ch, &mut cursor, total_frames, chunk_frames) {
+                    let rc_p = unsafe { waveOutPrepareHeader(hwo, &mut *slot.hdr, size_of::<WAVEHDR>() as u32) };
+                    if rc_p == 0 {
+                        slot.prepared = true;
+                        unsafe { waveOutWrite(hwo, &mut *slot.hdr, size_of::<WAVEHDR>() as u32); }
+                    }
+                }
+                slots.push(slot);
             }
 
-            let mut handle = Self {
+            let stop_flag = Arc::new(AtomicBool::new(false));
+            let finished = Arc::new(AtomicBool::new(cursor >= total_frames && slots.iter().all(|s| !s.prepared)));
+            let slots_arc = Arc::new(std::sync::Mutex::new(slots));
+
+            let v = (volume.clamp(0.0, 1.0) * 65535.0) as u32;
+            unsafe { waveOutSetVolume(hwo, (v << 16) | v); }
+
+            let sf = Arc::clone(&stop_flag);
+            let fin = Arc::clone(&finished);
+            let sl = Arc::clone(&slots_arc);
+            let feeder = thread::spawn(move || {
+                while !sf.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(25));
+                    if sf.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let mut guard = sl.lock().unwrap();
+                    let mut any_active = false;
+                    for slot in guard.iter_mut() {
+                        if slot.prepared && (slot.hdr.dw_flags & WHDR_DONE) == 0 {
+                            any_active = true;
+                            continue;
+                        }
+                        if slot.prepared {
+                            unsafe { waveOutUnprepareHeader(hwo, &mut *slot.hdr, size_of::<WAVEHDR>() as u32); }
+                            slot.prepared = false;
+                        }
+                        if fill_slot(slot, &samples, ch, &mut cursor, total_frames, chunk_frames) {
+                            let rc_p = unsafe { waveOutPrepareHeader(hwo, &mut *slot.hdr, size_of::<WAVEHDR>() as u32) };
+                            if rc_p == 0 {
+                                slot.prepared = true;
+                                unsafe { waveOutWrite(hwo, &mut *slot.hdr, size_of::<WAVEHDR>() as u32); }
+                                any_active = true;
+                            }
+                        }
+                    }
+                    if !any_active && cursor >= total_frames {
+                        fin.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            });
+
+            Ok(Self {
                 hwo,
-                hdr,
-                _pcm_buf: pcm_buf,
                 block_align,
                 start_frame: start,
                 total_frames,
-            };
-            handle.set_volume(volume);
-
-            let rc_write = unsafe { waveOutWrite(handle.hwo, &mut *handle.hdr, size_of::<WAVEHDR>() as u32) };
-            if rc_write != 0 {
-                return Err(format!("waveOutWrite failed (code {rc_write})"));
-            }
-            Ok(handle)
+                stop_flag,
+                finished,
+                feeder: Some(feeder),
+                slots: slots_arc,
+            })
         }
 
         pub fn set_volume(&mut self, volume: f32) {
@@ -257,7 +334,6 @@ mod backend {
         }
 
         pub fn current_frame(&mut self) -> (usize, bool) {
-            let done = (self.hdr.dw_flags & WHDR_DONE) != 0;
             let mut mmt = MMTIME { w_type: TIME_BYTES, u: [0, 0] };
             let rc = unsafe { waveOutGetPosition(self.hwo, &mut mmt, size_of::<MMTIME>() as u32) };
             let played_frames = if rc == 0 {
@@ -266,17 +342,27 @@ mod backend {
                 0
             };
             let cur = (self.start_frame + played_frames).min(self.total_frames);
-            (cur, done || cur >= self.total_frames)
+            let done = self.finished.load(Ordering::Relaxed) || cur >= self.total_frames;
+            (cur, done)
         }
     }
 
     impl Drop for WaveOutHandle {
         fn drop(&mut self) {
-            unsafe {
-                waveOutReset(self.hwo);
-                waveOutUnprepareHeader(self.hwo, &mut *self.hdr, size_of::<WAVEHDR>() as u32);
-                waveOutClose(self.hwo);
+            self.stop_flag.store(true, Ordering::Relaxed);
+            if let Some(j) = self.feeder.take() {
+                let _ = j.join();
             }
+            unsafe { waveOutReset(self.hwo); }
+            if let Ok(mut guard) = self.slots.lock() {
+                for slot in guard.iter_mut() {
+                    if slot.prepared {
+                        unsafe { waveOutUnprepareHeader(self.hwo, &mut *slot.hdr, size_of::<WAVEHDR>() as u32); }
+                        slot.prepared = false;
+                    }
+                }
+            }
+            unsafe { waveOutClose(self.hwo); }
         }
     }
 }
@@ -294,7 +380,7 @@ mod backend {
     }
 
     impl WaveOutHandle {
-        pub fn play_from(samples: &[i16], sample_rate: u32, channels: u16, start_frame: usize, _volume: f32) -> Result<Self, String> {
+        pub fn play_from(samples: std::sync::Arc<Vec<i16>>, sample_rate: u32, channels: u16, start_frame: usize, _volume: f32) -> Result<Self, String> {
             let ch = channels.max(1) as usize;
             let total_frames = samples.len() / ch;
             Ok(Self {
@@ -332,7 +418,7 @@ pub struct AudioPlayerState {
     pub tracks: Vec<LoadedWavTrack>,
     pub awc_bytes: Option<Arc<Vec<u8>>>,
     pub active_idx: Option<usize>,
-    pub active_samples: Vec<i16>,
+    pub active_samples: Arc<Vec<i16>>,
     pub playing: bool,
     pub paused: bool,
     pub cursor_frame: usize,
@@ -350,7 +436,7 @@ impl Default for AudioPlayerState {
             tracks: Vec::new(),
             awc_bytes: None,
             active_idx: None,
-            active_samples: Vec::new(),
+            active_samples: Arc::new(Vec::new()),
             playing: false,
             paused: false,
             cursor_frame: 0,
@@ -370,7 +456,7 @@ impl AudioPlayerState {
         self.tracks = tracks;
         self.awc_bytes = Some(awc_bytes);
         self.active_idx = None;
-        self.active_samples.clear();
+        self.active_samples = Arc::new(Vec::new());
         self.error = None;
         self.decoding_idx = None;
         self.decode_gen = self.decode_gen.wrapping_add(1);
@@ -382,8 +468,7 @@ impl AudioPlayerState {
         self.tracks.clear();
         self.awc_bytes = None;
         self.active_idx = None;
-        self.active_samples.clear();
-        self.active_samples.shrink_to_fit();
+        self.active_samples = Arc::new(Vec::new());
         self.error = None;
         self.decoding_idx = None;
         self.decode_gen = self.decode_gen.wrapping_add(1);
@@ -399,7 +484,7 @@ impl AudioPlayerState {
         self.decoding_idx = None;
         match res {
             Ok(pcm) => {
-                self.active_samples = pcm;
+                self.active_samples = Arc::new(pcm);
                 self.active_idx = Some(idx);
                 self.start_playback_at(idx, 0);
             }
@@ -421,7 +506,7 @@ impl AudioPlayerState {
         };
         let clamped = start_frame.min(total_frames);
         match backend::WaveOutHandle::play_from(
-            &self.active_samples,
+            Arc::clone(&self.active_samples),
             sample_rate,
             channels,
             clamped,
@@ -443,7 +528,7 @@ impl AudioPlayerState {
     }
 
     pub fn play_track(&mut self, idx: usize, start_frame: usize) {
-        let Some((coff, csz)) = self.tracks.get(idx).map(|t| (t.coff, t.csz)) else {
+        let Some((coff, csz, sub_stream)) = self.tracks.get(idx).map(|t| (t.coff, t.csz, t.sub_stream)) else {
             return;
         };
         self.handle = None;
@@ -457,7 +542,7 @@ impl AudioPlayerState {
         }
 
         // Decode PCM asynchronously on a worker thread so large streams (e.g. 32 MB / 33 min) never freeze the UI
-        self.active_samples.clear();
+        self.active_samples = Arc::new(Vec::new());
         self.active_idx = Some(idx);
         self.cursor_frame = 0;
         let Some(raw) = self.awc_bytes.clone() else {
@@ -468,7 +553,7 @@ impl AudioPlayerState {
         let pending = Arc::clone(&self.pending_decode);
         *pending.lock().unwrap() = None;
         std::thread::spawn(move || {
-            let res = awc::decode_single_awc_chunk(&raw, coff, csz).map(|(_, pcm)| pcm);
+            let res = awc::decode_single_awc_chunk(&raw, coff, csz, sub_stream).map(|(_, pcm)| pcm);
             *pending.lock().unwrap() = Some((idx, res));
         });
     }
