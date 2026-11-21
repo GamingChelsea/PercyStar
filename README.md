@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-v1.3.4-FFA81C?style=flat-square" alt="Version" />
+  <img src="https://img.shields.io/badge/Version-v1.3.5-FFA81C?style=flat-square" alt="Version" />
   <img src="https://img.shields.io/badge/Rust-1.85%2B-orange?style=flat-square&logo=rust" alt="Rust" />
   <img src="https://img.shields.io/badge/Shaders-RDNA2%20GFX10.3%20%E2%86%92%20HLSL%20%2F%20SPIR--V-FF4FA3?style=flat-square" alt="Shaders" />
   <img src="https://img.shields.io/badge/Textures-100%25%20DXGI%20%2B%20RDNA2%204KB%2F64KB-48D2FF?style=flat-square" alt="Textures" />
@@ -17,11 +17,11 @@
   <img src="https://img.shields.io/badge/Audio-Pure%20Rust%20Opus%20(Zero%20FFmpeg)-90EBA5?style=flat-square" alt="Audio" />
   <img src="https://img.shields.io/badge/Platform-Windows%20x64-0078D6?style=flat-square" alt="Windows" />
   <img src="https://img.shields.io/badge/Platform-macOS%20(Universal)-111111?style=flat-square&logo=apple" alt="macOS" />
-  <img src="https://img.shields.io/badge/License-Source--Available%20(No%20Modifications)-red?style=flat-square" alt="License" />
+  <img src="https://img.shields.io/badge/License-PercyStar%20Attribution%20(%40rpatty)-red?style=flat-square" alt="License" />
 </p>
 
 <p align="center">
-  <strong>Latest Release: <a href="https://github.com/rpatty-dev/PercyStar/releases/latest">Download PercyStar v1.3.4 (Win64 + In-App Auto-Updater)</a></strong> · <strong><a href="https://github.com/rpatty-dev/PercyStar/releases/download/v1.0.3/PercyStar_macOS.zip">macOS Universal Build</a></strong><br />
+  <strong>Latest Release: <a href="https://github.com/rpatty-dev/PercyStar/releases/latest">Download PercyStar v1.3.5 (Win64 + In-App Auto-Updater)</a></strong> · <strong><a href="https://github.com/rpatty-dev/PercyStar/releases/download/v1.0.3/PercyStar_macOS.zip">macOS Universal Build</a></strong><br />
   <strong>Live Research &amp; Breakthroughs Dashboard: <a href="https://percystar-breakthroughs.vercel.app">percystar-breakthroughs.vercel.app</a></strong> · <strong><a href="https://mapnavmeshsite.vercel.app">Interactive NavMesh World Map</a></strong><br />
   <sub>Windows users on v1.0.3+ can click the golden <b>★ Update Available</b> pill inside PercyStar for 1-click self-update.</sub>
 </p>
@@ -62,7 +62,14 @@
 
 ---
 
-## Features & Format Breakthroughs (v1.3.4)
+## Features & Format Breakthroughs (v1.3.5)
+
+- **`MHIU` `2048×2048` World Heightmap Decoder (`src/tex.rs`)**
+  - Decodes row-compressed `MHIU` terrain heightmaps (`-13000..+7000` X, `-9000..+11000` Y, `-50..+500m` Z) into a colorized `2048×2048` elevation texture with zoom & PNG export.
+- **`DAT` Audio Metadata (`src/dat.rs`), `Cutscene` `.cutc` & `phBound` AABB (`src/rsc9.rs`)**
+  - Decodes `DAT25`/`26`/`41`/`61` `.rel` hash->object index tables, `story000` cutscene cast/prop/`.anim` manifests, and `phBound` collision AABBs.
+- **Live 3D Stick-Man Dummy Animation Player (`src/anim.rs`)**
+  - Z-up articulated 3D stick-man rig with Play/Pause + timeline scrubber driven by decoded `crClipDictionary` durations, track counts, and clip hashes.
 
 - **`SGD5` Shader-Group & `DXBC` / `NOBC` / `FSSM` RDNA2 Pipeline**
   - Fast `0x1000`-aligned `SGD5` page scanner (`src/sgd5.rs`) + `NOBC` zlib fast-path (`0x64` / `0xA0`) + `OnceLock`-cached `dxcompiler.dll` lookup (`src/dxbc.rs`) feeding directly into the GFX10.3 RDNA2 → HLSL / SPIR-V lifter.

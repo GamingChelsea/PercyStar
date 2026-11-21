@@ -20,7 +20,8 @@ use rdna2::{
     lift_to_hlsl, lift_to_spirv,
 };
 use tex::{
-    DecodedTexture, build_dds_dx10, decode_0drpz_text, decode_navmesh_from_rpf, decode_rbf0,
+    DecodedTexture, build_dds_dx10, decode_0drpz_text, decode_mhiu_heightmap, decode_navmesh_from_rpf,
+    decode_rbf0,
     decode_ttpf_texture, decode_txd_from_rpf, export_texture_png, inspect_gfx, probe_txd_header,
     scan_ttpf_descriptors,
 };
@@ -1322,7 +1323,15 @@ impl Rpf9App {
                     let is_text = e.kind == "XML"
                         || (!sample.is_empty()
                             && sample.iter().all(|&b| (32..127).contains(&b) || matches!(b, 9 | 10 | 13 | 0x80..)));
-                    if e.kind == "PSIN" {
+                    if e.kind == "HMAP" {
+                        if let Some(t) = decode_mhiu_heightmap(&data) {
+                            self.textures = vec![t];
+                            self.tex_sel = 0;
+                            self.tex_handle = None;
+                        } else {
+                            self.preview = format_hex(&data[..data.len().min(2048)]);
+                        }
+                    } else if e.kind == "PSIN" {
                         self.preview = psin::parse_psin(&data);
                     } else if e.kind == "ANIM" {
                         self.preview = anim::parse_anim_dict(&data);
@@ -1395,7 +1404,7 @@ impl Rpf9App {
                 c[match e.kind {
                     "VEH" => 1,
                     "MODEL" => 2,
-                    "TXD" | "TTPF" => 3,
+                    "TXD" | "TTPF" | "HMAP" => 3,
                     "RBF0" | "GFX" | "GXT" => 4,
                     "NAVM" => 5,
                     "BK2" => 6,
@@ -1420,7 +1429,7 @@ impl Rpf9App {
                     Category::All => true,
                     Category::Vehicles => e.kind == "VEH",
                     Category::Models => e.kind == "VEH" || (!self.vehicles_only && e.kind == "MODEL"),
-                    Category::Textures => e.kind == "TXD" || e.kind == "TTPF",
+                    Category::Textures => e.kind == "TXD" || e.kind == "TTPF" || e.kind == "HMAP",
                     Category::Ui => e.kind == "RBF0" || e.kind == "GFX" || e.kind == "GXT",
                     Category::NavMesh => e.kind == "NAVM",
                     Category::Videos => e.kind == "BK2",
@@ -2709,6 +2718,7 @@ fn load_disk_cache() -> HashMap<String, Vec<RpfEntry>> {
             "AWC" => "AWC",
             "XML" => "XML",
             "DAT" => "DAT",
+            "HMAP" => "HMAP",
             "PSIN" => "PSIN",
             "ANIM" => "ANIM",
             "RSC9" => "RSC9",
@@ -2919,6 +2929,7 @@ fn kind_color(kind: &str) -> Color32 {
         "AWC" => Color32::from_rgb(90, 235, 165),
         "BK2" => Color32::from_rgb(252, 175, 23),
         "DAT" => Color32::from_rgb(135, 240, 165),
+        "HMAP" => Color32::from_rgb(72, 220, 155),
         "PSIN" => Color32::from_rgb(210, 120, 255),
         "ANIM" => Color32::from_rgb(100, 225, 195),
         "RSC9" => Color32::from_rgb(120, 185, 255),
@@ -3453,6 +3464,8 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
                                 ("GFX", format!("{z_idx:04}_scaleform.gfx"))
                             } else if let Some(slug) = tex::probe_gxt_snippet(&stitch_head) {
                                 ("GXT", format!("{z_idx:04}_{slug}.gxt"))
+                            } else if stitch_head.starts_with(b"MHIU") {
+                                ("HMAP", format!("{z_idx:04}_world_heightmap_2048.mhiu"))
                             } else if stitch_head.starts_with(b"PSIN") {
                                 ("PSIN", format!("{z_idx:04}_resource.psin"))
                             } else if let Some(ver) = dat::probe_dat(&stitch_head) {

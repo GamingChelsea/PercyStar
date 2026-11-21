@@ -1,8 +1,8 @@
 {
   "title": "RAGE 9 Research & PercyStar Breakthroughs",
   "author": "@rpatty",
-  "lastUpdated": "2026-11-21 09:30 UTC",
-  "percystarVersion": "v1.3.4",
+  "lastUpdated": "2026-11-21 11:12 UTC",
+  "percystarVersion": "v1.3.5",
   "links": {
     "github": "https://github.com/rpatty-dev/PercyStar",
     "latestRelease": "https://github.com/rpatty-dev/PercyStar/releases/tag/v1.3.3",
@@ -61,11 +61,40 @@
   ],
   "breakthroughs": [
     {
+      "id": "mhiu-heightmap-2048",
+      "timestamp": "2026-11-21 11:10 UTC",
+      "category": "World / Terrain",
+      "badge": "CRACKED \u00b7 MHIU 2048x2048",
+      "latest": true,
+      "image": "mhiu_heightmap_2048.png",
+      "title": "RAGE 9 MHIU 2048x2048 World Heightmap Cracked (common.rpf)",
+      "summary": "Cracked the row-compressed MHIU 2048x2048 terrain heightmap in common.rpf (1,172,743/1,172,743 bytes exact), revealing the full 20 km x 20 km world bounds (-13000..7000 X, -9000..11000 Y, -50..500m Z) with colorized PNG export in PercyStar.",
+      "details": [
+        "44-byte MHIU header: width/height=2048x2048, world AABB (-13000,-9000,-50)..(7000,11000,500).",
+        "2048 x 8-byte row descriptors (start_x, count_x, signed offset) indexing compressed u8 elevation pixels; sea level = 0x17.",
+        "Integrated into PercyStar Texture Viewer as HMAP with full PNG export."
+      ]
+    },
+    {
+      "id": "v135-cutc-dat-anim-boot",
+      "timestamp": "2026-11-21 11:05 UTC",
+      "category": "Audio / Anim / Bring-Up",
+      "badge": "SHIPPED \u00b7 v1.3.5",
+      "latest": true,
+      "title": "DAT25/26/41/61 Audio, Cutscene .cutc, 3D Stickman Anim Player & --inspect-exe",
+      "summary": "Shipped DAT audio metadata decoding, story000 cutscene (.cutc) cast/anim extraction, phBound collision AABBs, Z-up 3D stickman dummy animation player, and static PE64 --inspect-exe bring-up scanner.",
+      "details": [
+        "DAT (src/dat.rs): decodes audMetadata .rel headers, (hash, offset) index tables & audio:/ paths.",
+        "Cutscenes & Bounds (src/rsc9.rs): extracts pack:/cinematic cast/prop/.anim tracks & phBound AABBs.",
+        "Anim Player (src/anim.rs): Z-up 3D stickman dummy with Play/Pause & timeline scrubber from crAnimation durations."
+      ]
+    },
+    {
       "id": "psin-pso-decoder",
       "timestamp": "2026-11-21 09:24 UTC",
       "category": "Metadata / PSO",
       "badge": "CRACKED \u00b7 PSIN + LSCH + LENM",
-      "latest": true,
+      "latest": false,
       "title": "RAGE 9 PSIN Binary PSO Decoder \u2014 LSCH Schemas, LENM Enums & Instance Values",
       "summary": "Cracked the complete RAGE 9 PSIN IFF container (PSIN + LSCH + LENM + LSNS + LGID + LRSC + CHKS) across 701/701 files in script.rpf, 2,154 in story000_script.rpf, and 1,773+ in data.rpf, decoding typed fields (bool, ints, f32, vec3, JOAAT hashes, arrays, enums) into structured output.",
       "details": [
@@ -79,7 +108,7 @@
       "timestamp": "2026-11-21 09:29 UTC",
       "category": "Animation / Shaders / RSC9",
       "badge": "SHIPPED \u00b7 v1.3.4",
-      "latest": true,
+      "latest": false,
       "title": "crClipDictionary (ANIM), 0x71717171 RSC9 Tables, RBF0 Naming & SGD5/DXBC Optimizations",
       "summary": "Added native crClipDictionary (0DRPz) clip/animation table decoding, 0x71717171 pointer-tagged RSC9 dictionary inspection (30,683-entry script.rpf table), RBF0/common.rpf root-slug auto-naming, GDK boot manifest mapping (TitleId 7952987A), and 1000x faster 4KB-aligned SGD5 + OnceLock DXC pipeline.",
       "details": [
@@ -619,6 +648,11 @@
     }
   ],
   "releases": [
+    {
+      "version": "v1.3.5",
+      "date": "2026-11-21",
+      "title": "MHIU 2048x2048 World Heightmap, DAT Audio, Cutscene .cutc, 3D Stickman & --inspect-exe"
+    },
     {
       "version": "v1.3.4",
       "date": "2026-11-21",

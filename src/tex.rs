@@ -1421,3 +1421,81 @@ pub fn decode_navmesh_from_rpf(rpf_path: &Path, file_off: u64, fallback_name: &s
         "NavMesh".into(),
     ))
 }
+
+// decode rage 9 mhiu 2048x2048 row-compressed world heightmap into colorized elevation texture
+pub fn decode_mhiu_heightmap(data: &[u8]) -> Option<DecodedTexture> {
+    if data.len() < 44 || &data[..4] != b"MHIU" {
+        return None;
+    }
+    let w = u16::from_le_bytes([data[6], data[7]]) as usize;
+    let h = u16::from_le_bytes([data[8], data[9]]) as usize;
+    if w == 0 || h == 0 || w > 4096 || h > 4096 || data.len() < 44 + h * 8 {
+        return None;
+    }
+    let rows = &data[44..44 + h * 8];
+    let pix = &data[44 + h * 8..];
+    let mut vals = vec![23u8; w * h];
+    for y in 0..h {
+        let r = &rows[y * 8..y * 8 + 8];
+        let sx = u16::from_le_bytes([r[0], r[1]]) as usize;
+        let cnt = u16::from_le_bytes([r[2], r[3]]) as usize;
+        let off = i32::from_le_bytes([r[4], r[5], r[6], r[7]]) as isize;
+        if cnt > 0 && sx + cnt <= w {
+            let src = off + sx as isize;
+            if src >= 0 && (src as usize) + cnt <= pix.len() {
+                vals[y * w + sx..y * w + sx + cnt].copy_from_slice(&pix[src as usize..src as usize + cnt]);
+            }
+        }
+    }
+    let mut pixels = Vec::with_capacity(w * h);
+    for &v in &vals {
+        let c = if v <= 23 {
+            Color32::from_rgb(16, 44, 92)
+        } else if v <= 30 {
+            let t = (v - 23) as u8 * 14;
+            Color32::from_rgb(45 + t, 115 + t, 72)
+        } else if v <= 85 {
+            let t = ((v - 30) as u16 * 120 / 55) as u8;
+            Color32::from_rgb(80 + t, 145 + t / 2, 70)
+        } else {
+            let t = ((v - 85) as u16 * 100 / 170) as u8;
+            Color32::from_rgb(155 + t, 145 + t, 130 + t)
+        };
+        pixels.push(c);
+    }
+    Some(DecodedTexture {
+        name: format!("world_heightmap_{w}x{h}"),
+        w,
+        h,
+        mips: 1,
+        fmt_name: "MHIU RLE8".into(),
+        dxgi: 28,
+        pixels,
+        raw_dds_payload: Vec::new(),
+    })
+}
+
+#[cfg(test)]
+mod mhiu_tests {
+    use super::*;
+
+    #[test]
+    fn decodes_synthetic_mhiu_heightmap() {
+        let mut buf = vec![0u8; 44 + 4 * 8 + 2];
+        buf[0..4].copy_from_slice(b"MHIU");
+        buf[6..8].copy_from_slice(&4u16.to_le_bytes());
+        buf[8..10].copy_from_slice(&4u16.to_le_bytes());
+        // row 1: sx=1, cnt=2, off=-1 -> pix[0..2]
+        let r1 = 44 + 8;
+        buf[r1..r1 + 2].copy_from_slice(&1u16.to_le_bytes());
+        buf[r1 + 2..r1 + 4].copy_from_slice(&2u16.to_le_bytes());
+        buf[r1 + 4..r1 + 8].copy_from_slice(&(-1i32).to_le_bytes());
+        buf[44 + 32] = 60;
+        buf[44 + 33] = 120;
+        let tex = decode_mhiu_heightmap(&buf).expect("should decode mhiu");
+        assert_eq!(tex.w, 4);
+        assert_eq!(tex.h, 4);
+        assert_eq!(tex.pixels[0], Color32::from_rgb(16, 44, 92));
+        assert_ne!(tex.pixels[5], Color32::from_rgb(16, 44, 92));
+    }
+}
