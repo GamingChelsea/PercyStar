@@ -1,8 +1,8 @@
 {
   "title": "RAGE 9 Research & PercyStar Breakthroughs",
   "author": "@rpatty",
-  "lastUpdated": "2026-11-21 11:12 UTC",
-  "percystarVersion": "v1.3.5",
+  "lastUpdated": "2026-11-21 11:58 UTC",
+  "percystarVersion": "v1.3.6",
   "links": {
     "github": "https://github.com/rpatty-dev/PercyStar",
     "latestRelease": "https://github.com/rpatty-dev/PercyStar/releases/tag/v1.3.3",
@@ -61,11 +61,25 @@
   ],
   "breakthroughs": [
     {
+      "id": "v136-full-22-rpf-audit",
+      "timestamp": "2026-11-21 11:58 UTC",
+      "category": "Full Build Audit",
+      "badge": "COMPLETE \u00b7 22/22 RPFs",
+      "latest": true,
+      "title": "All 22 RPFs & 48,025 Shaders Audited \u2014 26,212-Sector Grid, 833 UI RBF0s & 3,341 VFS Paths",
+      "summary": "Completed full pre-EXE audit across all 22 RPF9 archives and shaders.rpf: 26,212-sector world grid PSIN (levels.rpf @0x24000), 833 RBF0 UI/GPS/gamepad files (data.rpf), 3,341 VFS mount paths + 32 vehicle meta names (common.rpf), and end-to-end verification of 26,503 SGD5 + 21,522 PS09 shaders.",
+      "details": [
+        "World Grid: 26,212 x 32B sector records in levels.rpf @0x24000 (struct 0x9c834886) + dual 2048x2048 MHIU heightmaps in common.rpf.",
+        "UI & VFS: 833 RBF0 UI/subtitle/GPS/gamepad configs in data.rpf + 3,341 virtual paths & 32 vehicle names in common.rpf.",
+        "Shaders Verified: 26,503 SGD5 (CS=2,689 GS=195 PS=12,101 VS=11,518) + 21,522 PS09 (PS=9,535 VS=1,343 CS=3,082 NGG=7,498 RT_BVH64=64)."
+      ]
+    },
+    {
       "id": "mhiu-heightmap-2048",
       "timestamp": "2026-11-21 11:10 UTC",
       "category": "World / Terrain",
       "badge": "CRACKED \u00b7 MHIU 2048x2048",
-      "latest": true,
+      "latest": false,
       "image": "mhiu_heightmap_2048.png",
       "title": "RAGE 9 MHIU 2048x2048 World Heightmap Cracked (common.rpf)",
       "summary": "Cracked the row-compressed MHIU 2048x2048 terrain heightmap in common.rpf (1,172,743/1,172,743 bytes exact), revealing the full 20 km x 20 km world bounds (-13000..7000 X, -9000..11000 Y, -50..500m Z) with colorized PNG export in PercyStar.",
@@ -80,7 +94,7 @@
       "timestamp": "2026-11-21 11:05 UTC",
       "category": "Audio / Anim / Bring-Up",
       "badge": "SHIPPED \u00b7 v1.3.5",
-      "latest": true,
+      "latest": false,
       "title": "DAT25/26/41/61 Audio, Cutscene .cutc, 3D Stickman Anim Player & --inspect-exe",
       "summary": "Shipped DAT audio metadata decoding, story000 cutscene (.cutc) cast/anim extraction, phBound collision AABBs, Z-up 3D stickman dummy animation player, and static PE64 --inspect-exe bring-up scanner.",
       "details": [
@@ -648,6 +662,11 @@
     }
   ],
   "releases": [
+    {
+      "version": "v1.3.6",
+      "date": "2026-11-21",
+      "title": "Full 22-RPF Audit, 26,212-Sector Grid, 48,025 Shaders Verified & Attribution License v1.2"
+    },
     {
       "version": "v1.3.5",
       "date": "2026-11-21",

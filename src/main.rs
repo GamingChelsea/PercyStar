@@ -7,6 +7,7 @@ mod dxbc;
 mod psin;
 mod rsc9;
 mod sgd5;
+mod worldmap;
 mod model3d;
 mod rdna2;
 mod tex;
@@ -175,6 +176,7 @@ enum AppTab {
     #[default]
     Explorer,
     ModelViewer,
+    WorldMap,
     Shaders,
 }
 
@@ -676,6 +678,7 @@ struct Rpf9App {
     sort_mode: SortMode,
     view_sort: SortMode,
     mv_sort: SortMode,
+    world_map: worldmap::WorldMapState,
     // dedicated rdna2 gfx103 ps09 shader disassembler and hlsl spirv lifter tab
     sh_cache: Option<Ps09Cache>,
     sh_status: String,
@@ -796,6 +799,7 @@ impl Rpf9App {
             sort_mode: SortMode::Relevance,
             view_sort: SortMode::Relevance,
             mv_sort: SortMode::Relevance,
+            world_map: worldmap::WorldMapState::default(),
             mv_rng: 0x9E37_79B9_7F4A_7C15,
             sh_cache: None,
             sh_status: String::new(),
@@ -3536,10 +3540,11 @@ impl eframe::App for Rpf9App {
                 ui.label(RichText::new("RPF9").size(13.0).strong().color(Color32::from_rgb(255, 72, 165)));
                 ui.label(RichText::new(format!("v{APP_VERSION}")).size(11.5).color(Color32::from_rgb(165, 145, 195)));
                 ui.add_space(10.0);
-                // Top-level mode tabs: Explorer | Model Viewer | Shaders (RDNA2)
+                // Top-level mode tabs: Explorer | Model Viewer | World Map | Shaders (RDNA2)
                 for (tab_id, label) in [
                     (AppTab::Explorer, "Explorer"),
                     (AppTab::ModelViewer, "Model Viewer"),
+                    (AppTab::WorldMap, "World Map"),
                     (AppTab::Shaders, "Shaders (RDNA2)"),
                 ] {
                     let active = self.tab == tab_id;
@@ -3555,6 +3560,21 @@ impl eframe::App for Rpf9App {
                         if tab_id == AppTab::ModelViewer {
                             self.stop_bink_player();
                             self.show_3d = true;
+                        } else if tab_id == AppTab::WorldMap {
+                            self.stop_bink_player();
+                            if self.world_map.data.is_none() {
+                                let common = self.target_path.as_ref().and_then(|p| {
+                                    if p.is_dir() { Some(p.join("common.rpf")) }
+                                    else if p.file_name().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("common.rpf")).unwrap_or(false) { Some(p.clone()) }
+                                    else { p.parent().map(|d| d.join("common.rpf")) }
+                                }).filter(|p| p.exists());
+                                if let Some(cp) = common {
+                                    if let Ok(d) = worldmap::load_mhiu_from_rpf(&cp) {
+                                        self.world_map.status = format!("Loaded {}x{} MHIU", d.w, d.h);
+                                        self.world_map.data = Some(d);
+                                    }
+                                }
+                            }
                         } else if tab_id == AppTab::Shaders {
                             self.stop_bink_player();
                             if self.sh_cache.is_none() {
@@ -3657,6 +3677,31 @@ impl eframe::App for Rpf9App {
 
         if self.tab == AppTab::ModelViewer {
             self.render_model_viewer_tab(ctx, media_loading, &media_status);
+        } else if self.tab == AppTab::WorldMap {
+            let nav_tiles: Vec<(usize, f32, f32)> = {
+                let st = self.state.lock().unwrap();
+                st.entries.iter().enumerate().filter_map(|(i, e)| {
+                    if e.kind == "NAVM" {
+                        worldmap::parse_nav_coords(&e.name).map(|(wx, wy)| (i, wx, wy))
+                    } else { None }
+                }).collect()
+            };
+            let common = self.target_path.as_ref().and_then(|p| {
+                if p.is_dir() { Some(p.join("common.rpf")) }
+                else { p.parent().map(|d| d.join("common.rpf")) }
+            }).filter(|p| p.exists());
+            let levels = self.target_path.as_ref().and_then(|p| {
+                if p.is_dir() { Some(p.join("levels.rpf")) }
+                else { p.parent().map(|d| d.join("levels.rpf")) }
+            }).filter(|p| p.exists());
+            let mut clicked_nav = None;
+            egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(13, 9, 21)).inner_margin(10.0)).show(ctx, |ui| {
+                clicked_nav = worldmap::render_world_map_ui(ui, ctx, &mut self.world_map, &nav_tiles, common.as_deref(), levels.as_deref());
+            });
+            if let Some(idx) = clicked_nav {
+                self.tab = AppTab::Explorer;
+                self.select_entry(idx);
+            }
         } else if self.tab == AppTab::Shaders {
             self.render_shader_tab(ctx);
         } else {

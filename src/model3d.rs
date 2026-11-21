@@ -1657,6 +1657,20 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
             mesh.zoom = (mesh.zoom * (1.0 + scroll * 0.0022)).clamp(0.15, 25.0);
             mesh.dirty = true;
         }
+        // codewalker-style wasd + q/e camera navigation
+        let (fw, rt, up) = ui.input(|i| {
+            let f = (i.key_down(egui::Key::W) as i32 - i.key_down(egui::Key::S) as i32) as f32;
+            let r = (i.key_down(egui::Key::D) as i32 - i.key_down(egui::Key::A) as i32) as f32;
+            let u = (i.key_down(egui::Key::E) as i32 - i.key_down(egui::Key::Q) as i32) as f32;
+            (f, r, u)
+        });
+        if fw != 0.0 || rt != 0.0 || up != 0.0 {
+            mesh.zoom = (mesh.zoom * (1.0 + fw * 0.03)).clamp(0.15, 25.0);
+            mesh.pan_x -= rt * 0.015;
+            mesh.pan_y += up * 0.015;
+            mesh.dirty = true;
+            ui.ctx().request_repaint();
+        }
     }
     if mesh.auto_spin && !dragging {
         mesh.yaw += 0.014;
